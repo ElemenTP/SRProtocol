@@ -1,4 +1,4 @@
-/*************************滑动窗口协议实验 选择重传v1.0 20210508*************************/
+/*************************滑动窗口协议实验 选择重传v1.1 20210513*************************/
 #include "datalink.h"
 #include "protocol.h"
 #include <stdio.h>
@@ -134,11 +134,9 @@ int main(int argc, char **argv)
     byte to_send;                //下一个发送序号
     byte recv_upper, recv_lower; //接收窗口上界，下届
     byte to_ack;                 //需要发送的ACK
-    byte ptr_tmp;                //临时缓存指针
-    int event, arg, length;      //事件编号，事件的参数，接收帧长度
+    int event, arg;              //事件编号，事件的参数
     BUFFER send_buf[NR_BUFS];    //发送缓存组
     BUFFER recv_buf[NR_BUFS];    //接收缓存组
-    FRAME recv_tmp;              //接收帧缓存
 
     send_lower = 0;
     send_upper = NR_BUFS - 1;
@@ -183,10 +181,11 @@ int main(int argc, char **argv)
 
             //收到帧
         case FRAME_RECEIVED:
+            FRAME r; //接收帧缓存
             //获取收到的帧和长度
-            length = recv_frame((unsigned char *)&recv_tmp, sizeof(recv_tmp));
+            int length = recv_frame((unsigned char *)&r, sizeof(r));
             //若帧长度不符合任何可能的帧，或者CRC校验错误，认为收到了错误的帧
-            if (length < 6 || crc32((unsigned char *)&recv_tmp, length) != 0)
+            if (length < 6 || crc32((unsigned char *)&r, length) != 0)
             {
                 dbg_event("****** Receiver Error, Bad CRC ******\n");
                 //若接收窗口下界所指帧未发送过NAK则发送NAK，并标记已发送过NAK
@@ -199,34 +198,62 @@ int main(int argc, char **argv)
             }
 
             //收到正确的帧
-            switch (recv_tmp.kind)
+            switch (r.kind)
             {
+                byte *data, *ack; //接收的数据与ACK的指针
+                int data_length;  //数据长度
+
                 //收到数据帧
             case FRAME_DATA:
+                data = &(r.ack);
+                data_length = length - 6;
+
+                //收到捎带ACK的数据帧
+            case FRAME_DATA_ACK:
+                if (r.kind == FRAME_DATA_ACK)
+                {
+                    data = r.data;
+                    data_length = length - 7;
+                    ack = &(r.ack);
+                }
                 //该数据帧编号在窗口中，且对应缓存未被占用
-                if (inwindow(recv_lower, recv_tmp.seq, recv_upper) && recv_buf[recv_tmp.seq % NR_BUFS].buf_status != used)
+                if (inwindow(recv_lower, r.seq, recv_upper) && recv_buf[r.seq % NR_BUFS].buf_status != used)
                 {
                     //将接收到的帧的数据，数据长度加入缓存，并标记该缓存已用
-                    memcpy(recv_buf[recv_tmp.seq % NR_BUFS].data, &(recv_tmp.ack), length - 6);
-                    recv_buf[recv_tmp.seq % NR_BUFS].data_length = length - 6;
-                    recv_buf[recv_tmp.seq % NR_BUFS].buf_status = used;
+                    memcpy(recv_buf[r.seq % NR_BUFS].data, data, data_length);
+                    recv_buf[r.seq % NR_BUFS].data_length = data_length;
+                    recv_buf[r.seq % NR_BUFS].buf_status = used;
                     //检测是否已有待发ACK，无则设置当前ACK为待发ACK，有则立刻发送待发ACK后设置当前ACK为待发ACK
                     if (to_ack > MAX_SEQ)
-                        to_ack = recv_tmp.seq;
+                        to_ack = r.seq;
                     else
                     {
-                        stop_ack_timer;
+                        stop_ack_timer();
                         send_ack_frame(to_ack);
-                        to_ack = recv_tmp.seq;
+                        to_ack = r.seq;
                     }
                     start_ack_timer(ACK_TIMER);
-                    dbg_event("Receive DATA %d, ID %d\n", recv_tmp.seq, *(short *)recv_buf[recv_tmp.seq % NR_BUFS].data);
+                    dbg_event("Receive DATA %d, ID %d\n", r.seq, *(short *)data);
+                    if (r.seq == recv_lower)
+                    {
+                        //若接收窗口下界缓存状态为已用则将数据传递给网络层并移动窗口，循环尽可能移动窗口
+                        do
+                        {
+                            put_packet(recv_buf[recv_lower % NR_BUFS].data, recv_buf[recv_lower % NR_BUFS].data_length);
+                            recv_buf[recv_lower % NR_BUFS].buf_status = empty;
+                            incre(recv_lower);
+                            incre(recv_upper);
+                        } while (recv_buf[recv_lower % NR_BUFS].buf_status == used);
+
+                        //检测到窗口移动就发送debug事件
+                        dbg_event("Receiver window moved, new lower %d, new upper %d\n", recv_lower, recv_upper);
+                    }
                     //检测丢帧，有丢帧则将疑似丢失且未发送过NAK的帧发送NAK
-                    if (recv_tmp.seq != recv_lower)
+                    else
                     {
                         dbg_event("Frames lost detected.\n");
-                        ptr_tmp = recv_lower;
-                        while (ptr_tmp != recv_tmp.seq)
+                        byte ptr_tmp = recv_lower;
+                        while (ptr_tmp != r.seq)
                         {
                             if (recv_buf[ptr_tmp % NR_BUFS].buf_status == empty)
                             {
@@ -242,88 +269,52 @@ int main(int argc, char **argv)
                 {
                     dbg_event("Repeated frame detected.\n");
                     if (to_ack > MAX_SEQ)
-                        to_ack = recv_tmp.seq;
+                        to_ack = r.seq;
                     else
                     {
-                        stop_ack_timer;
+                        stop_ack_timer();
                         send_ack_frame(to_ack);
-                        to_ack = recv_tmp.seq;
+                        to_ack = r.seq;
                     }
                     start_ack_timer(ACK_TIMER);
                 }
-                break;
-
-                //收到捎带ACK的数据帧
-            case FRAME_DATA_ACK:
-                if (inwindow(recv_lower, recv_tmp.seq, recv_upper) && recv_buf[recv_tmp.seq % NR_BUFS].buf_status != used)
-                {
-                    memcpy(recv_buf[recv_tmp.seq % NR_BUFS].data, recv_tmp.data, length - 7);
-                    recv_buf[recv_tmp.seq % NR_BUFS].data_length = length - 7;
-                    recv_buf[recv_tmp.seq % NR_BUFS].buf_status = used;
-                    if (to_ack > MAX_SEQ)
-                        to_ack = recv_tmp.seq;
-                    else
-                    {
-                        stop_ack_timer;
-                        send_ack_frame(to_ack);
-                        to_ack = recv_tmp.seq;
-                    }
-                    start_ack_timer(ACK_TIMER);
-                    dbg_event("Receive DATA with ACK %d %d, ID %d\n", recv_tmp.seq, recv_tmp.ack, *(short *)recv_buf[recv_tmp.seq % NR_BUFS].data);
-                    if (recv_tmp.seq != recv_lower)
-                    {
-                        dbg_event("Detect frames lost.\n");
-                        ptr_tmp = recv_lower;
-                        while (ptr_tmp != recv_tmp.seq)
-                        {
-                            if (recv_buf[ptr_tmp % NR_BUFS].buf_status == empty)
-                            {
-                                send_nak_frame(ptr_tmp);
-                                recv_buf[ptr_tmp % NR_BUFS].buf_status = spec;
-                            }
-                            incre(ptr_tmp);
-                        }
-                    }
-                }
-                else
-                {
-                    dbg_event("Repeated frame detected.\n");
-                    if (to_ack > MAX_SEQ)
-                        to_ack = recv_tmp.seq;
-                    else
-                    {
-                        stop_ack_timer;
-                        send_ack_frame(to_ack);
-                        to_ack = recv_tmp.seq;
-                    }
-                    start_ack_timer(ACK_TIMER);
-                }
-                //处理捎带ACK，ACK序号在窗口中且对应缓存已占用，则标记该缓存为已收到ACK的状态，停止重传计时
-                if (inwindow(send_lower, recv_tmp.ack, send_upper) && send_buf[recv_tmp.ack % NR_BUFS].buf_status == used)
-                {
-                    send_buf[recv_tmp.ack % NR_BUFS].buf_status = spec;
-                    stop_timer(recv_tmp.ack);
-                }
-                break;
+                if (r.kind == FRAME_DATA)
+                    break;
 
                 //收到ACK帧
             case FRAME_ACK:
-                if (inwindow(send_lower, recv_tmp.seq, send_upper) && send_buf[recv_tmp.seq % NR_BUFS].buf_status == used)
+                if (r.kind == FRAME_ACK)
+                    ack = &(r.seq);
+                //检测收到的ACK是否在窗口中
+                if (inwindow(send_lower, *ack, send_upper) && send_buf[*ack % NR_BUFS].buf_status == used)
                 {
-                    dbg_event("Receive ACK %d.\n", recv_tmp.seq);
-                    send_buf[recv_tmp.seq % NR_BUFS].buf_status = spec;
-                    stop_timer(recv_tmp.seq);
+                    dbg_event("Receive ACK %d.\n", *ack);
+                    send_buf[*ack % NR_BUFS].buf_status = spec;
+                    stop_timer(*ack);
+                    if (*ack == send_lower)
+                    {
+                        //若发送窗口下界缓存状态为已收到ACK则移动窗口，循环尽可能移动窗口
+                        do
+                        {
+                            send_buf[send_lower % NR_BUFS].buf_status = empty;
+                            incre(send_lower);
+                            incre(send_upper);
+                        } while (send_buf[send_lower % NR_BUFS].buf_status == spec);
+
+                        //检测到窗口移动就发送debug事件
+                        dbg_event("Sender window moved, new lower %d, new upper %d\n", send_lower, send_upper);
+                    }
                 }
                 break;
 
                 //收到NAK帧
             case FRAME_NAK:
                 //NAK序号在窗口中且对应缓存已占用，则立刻重传该帧
-                if (inwindow(send_lower, recv_tmp.seq, send_upper) && send_buf[recv_tmp.seq % NR_BUFS].buf_status == used)
+                if (inwindow(send_lower, r.seq, send_upper) && send_buf[r.seq % NR_BUFS].buf_status == used)
                 {
-                    dbg_event("Receive NAK %d.\n", recv_tmp.seq);
-                    stop_timer(recv_tmp.seq);
-                    send_data_frame(recv_tmp.seq, to_ack, send_buf[recv_tmp.seq % NR_BUFS].data, send_buf[recv_tmp.seq % NR_BUFS].data_length);
+                    dbg_event("Receive NAK %d.\n", r.seq);
+                    stop_timer(r.seq);
+                    send_data_frame(r.seq, to_ack, send_buf[r.seq % NR_BUFS].data, send_buf[r.seq % NR_BUFS].data_length);
                     to_ack = MAX_SEQ + 1;
                 }
                 break;
@@ -353,36 +344,6 @@ int main(int argc, char **argv)
             to_ack = MAX_SEQ + 1;
             break;
         }
-
-        //debug用，记录窗口移动前的窗口下界
-        int tmp_lower = recv_lower;
-
-        //若接收窗口下界缓存状态为已用则将数据传递给网络层并移动窗口，循环尽可能移动窗口
-        while (recv_buf[recv_lower % NR_BUFS].buf_status == used)
-        {
-            put_packet(recv_buf[recv_lower % NR_BUFS].data, recv_buf[recv_lower % NR_BUFS].data_length);
-            recv_buf[recv_lower % NR_BUFS].buf_status = empty;
-            incre(recv_lower);
-            incre(recv_upper);
-        }
-
-        //检测到窗口移动就发送debug事件
-        if (tmp_lower != recv_lower)
-            dbg_event("Receiver window moved, new lower %d, new upper %d\n", recv_lower, recv_upper);
-
-        tmp_lower = send_lower;
-
-        //若发送窗口下界缓存状态为已收到ACK则移动窗口，循环尽可能移动窗口
-        while (send_buf[send_lower % NR_BUFS].buf_status == spec)
-        {
-            send_buf[send_lower % NR_BUFS].buf_status = empty;
-            incre(send_lower);
-            incre(send_upper);
-        }
-
-        //检测到窗口移动就发送debug事件
-        if (tmp_lower != send_lower)
-            dbg_event("Sender window moved, new lower %d, new upper %d\n", send_lower, send_upper);
 
         //当发送序号在发送窗口中，且物理层可用时开启网络层
         if (inwindow(send_lower, to_send, send_upper) && phl_ready)
